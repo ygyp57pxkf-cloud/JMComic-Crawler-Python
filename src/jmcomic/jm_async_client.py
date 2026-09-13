@@ -7,6 +7,8 @@ from __future__ import annotations
 
 import asyncio
 import json
+from copy import deepcopy
+from typing import Sequence
 from urllib.parse import urlencode
 
 from curl_cffi.requests import AsyncSession
@@ -17,7 +19,7 @@ from .jm_client_interface import (
 )
 from .jm_entity import (
     JmAlbumDetail, JmPhotoDetail, JmSearchPage, JmCategoryPage,
-    JmFavoritePage, DetailType
+    JmFavoritePage, DetailType, JmAlbumCommentPage
 )
 from .jm_config import JmModuleConfig, JmMagicConstants, time_stamp, jm_log
 from .jm_toolkit import (
@@ -33,7 +35,7 @@ class AsyncJmApiClient(AsyncJmcomicClient):
     禁漫移动端异步 API 客户端。
 
     继承 AsyncJmcomicClient 接口，提供全面的异步网络通信能力，
-    涵盖图集、章节、搜索、登录与收藏夹等功能模块。
+    涵盖本子、章节、搜索、登录与收藏夹等功能模块。
     通过异步会话管理与并发请求调度，显著提升网络 I/O 的处理性能与吞吐量。
     """
 
@@ -46,18 +48,23 @@ class AsyncJmApiClient(AsyncJmcomicClient):
     API_CHAPTER = '/chapter'
     API_SCRAMBLE = '/chapter_view_template'
     API_FAVORITE = '/favorite'
+    API_FORUM = '/forum'
 
     # 缓存未命中标记
     _SENTINEL = object()
 
     # 类级别初始化标记与锁，防止并发更新域名
-    _has_setup_domain_and_cookies = False
+    _has_setup_domain = False
     _setup_lock = asyncio.Lock()
 
-    def __init__(self, option: JmOption, max_clients=None, **kwargs):
+    def __init__(self, option: JmOption, max_clients=None, domain_list=None, **kwargs):
+        if 'domain_retry_strategy' in kwargs:
+            raise TypeError('Async client does not support domain_retry_strategy')
+
         self.option = option
-        self._domain_list = self._resolve_domain_list()
-        self._retry_times = option.client.get('retry_times', 5) or 5
+        self._domain_list = self._resolve_domain_list(domain_list)
+        retry_times = option.client.get('retry_times')
+        self._retry_times = retry_times if retry_times is not None else 5
         self._timeout = option.client.get('timeout', 30) or 30
         # AsyncSession 句柄池大小：优先用调用方（下载器）传入的实际图片并发，
         # 否则回退到 option 配置；避免因默认限制导致真实并发被隐式压低。
@@ -83,22 +90,41 @@ class AsyncJmApiClient(AsyncJmcomicClient):
     # 域名管理
     # ======================================================================
 
-    def _resolve_domain_list(self) -> list[str]:
+    @staticmethod
+    def _normalize_domain_list(domain_list) -> list[str]:
+        if isinstance(domain_list, str):
+            return [domain.strip() for domain in domain_list.splitlines() if domain.strip()]
+
+        if isinstance(domain_list, Sequence):
+            result = []
+            for domain in domain_list:
+                if not isinstance(domain, str):
+                    raise TypeError(f'domain must be str, got {type(domain)}')
+                domain = domain.strip()
+                if domain:
+                    result.append(domain)
+            return result
+
+        raise TypeError('domain_list must be str, Sequence[str], or None')
+
+    def _resolve_domain_list(self, domain_list=None) -> list[str]:
         """解析并返回可用的 API 域名列表"""
-        updated = JmModuleConfig.DOMAIN_API_UPDATED_LIST
-        if updated:
-            return list(updated)
+        if domain_list is not None:
+            resolved = self._normalize_domain_list(domain_list)
+            if resolved:
+                return resolved
+
         domain = self.option.client.domain
         if hasattr(domain, 'get'):
             domain_list = domain.get('api', [])
-        elif isinstance(domain, list):
-            domain_list = domain
-        elif isinstance(domain, str):
-            domain_list = [d.strip() for d in domain.split('\n') if d.strip()]
         else:
-            domain_list = []
-        if domain_list:
-            return domain_list
+            domain_list = domain
+
+        if domain_list is not None:
+            resolved = self._normalize_domain_list(domain_list)
+            if resolved:
+                return resolved
+
         return list(JmModuleConfig.DOMAIN_API_LIST)
 
     def get_domain_list(self) -> list[str]:
@@ -106,6 +132,20 @@ class AsyncJmApiClient(AsyncJmcomicClient):
 
     def set_domain_list(self, domain_list: list[str]):
         self._domain_list = domain_list
+
+    def update_old_api_domain(self, new_server_list: list[str]):
+        if not new_server_list:
+            return
+
+        if sorted(self._domain_list) != sorted(JmModuleConfig.DOMAIN_API_LIST):
+            return
+
+        old_server_list = self._domain_list
+        self._domain_list = list(new_server_list)
+        jm_log(
+            'api.update_domain.replace',
+            f'替换异步客户端的内置API域名：(old){old_server_list} ---→ (new){self._domain_list}',
+        )
 
     # ======================================================================
     # 缓存
@@ -145,7 +185,6 @@ class AsyncJmApiClient(AsyncJmcomicClient):
                 return
 
             # 提取应用配置中预设的网络通信元数据信息（如代理配置与全局 Headers）
-            from copy import deepcopy
             postman_conf = deepcopy(self.option.client.get('postman', {}))
             meta_data = postman_conf.get('meta_data', {})
             if self._meta_kwargs:
@@ -221,6 +260,7 @@ class AsyncJmApiClient(AsyncJmcomicClient):
         if not domain_list:
             ExceptionTool.raises("无可用 API 域名列表")
 
+        retry_errors = []
         for domain_index, domain in enumerate(domain_list):
             url = self._build_api_url(url_path, domain)
 
@@ -250,11 +290,21 @@ class AsyncJmApiClient(AsyncJmcomicClient):
                     return resp
                 except Exception as e:
                     self.before_retry(e, url, retry, domain_index)
+                    retry_errors.append({
+                        'domain': domain,
+                        'url': url,
+                        'retry': retry,
+                        'error': e,
+                    })
 
         # 所有域名都失败
         msg = f"请求重试全部失败: [{url_path}], {domain_list}"
         jm_log('req.fallback', msg)
-        ExceptionTool.raises(msg, {}, RequestRetryAllFailException)
+        ExceptionTool.raises(
+            msg,
+            {ExceptionTool.CONTEXT_KEY_RETRY_ERRORS: retry_errors},
+            RequestRetryAllFailException,
+        )
 
     # noinspection PyMethodMayBeStatic,PyUnusedLocal
     def before_retry(self, e, url, retry, domain_index):
@@ -354,7 +404,7 @@ class AsyncJmApiClient(AsyncJmcomicClient):
         cached = self._cache_get(cache_key)
         if cached is not self._SENTINEL:
             # noinspection PyTypeChecker
-            return cached
+            return deepcopy(cached)
 
         url = self.API_ALBUM if issubclass(clazz, JmAlbumDetail) else self.API_CHAPTER
         resp = await self.req_api(url, params={'id': jmid})
@@ -363,11 +413,11 @@ class AsyncJmApiClient(AsyncJmcomicClient):
             ExceptionTool.raise_missing(resp, jmid)
 
         result = JmApiAdaptTool.parse_entity(resp.res_data, clazz)
-        self._cache_set(cache_key, result)
+        self._cache_set(cache_key, deepcopy(result))
         return result
 
     async def get_album_detail(self, album_id) -> JmAlbumDetail:
-        """获取图集详情信息"""
+        """获取本子详情信息"""
         return await self._fetch_detail_entity(album_id, JmModuleConfig.album_class())
 
     async def get_photo_detail(self,
@@ -384,7 +434,7 @@ class AsyncJmApiClient(AsyncJmcomicClient):
     async def _fetch_photo_additional_field(self, photo: JmPhotoDetail,
                                             fetch_album: bool,
                                             fetch_scramble_id: bool):
-        """并发获取图片从属的图集信息与 scramble_id 加解密参数。"""
+        """并发获取图片从属的本子信息与 scramble_id 加解密参数。"""
         tasks = {}
         if fetch_album:
             tasks['album'] = self.get_album_detail(photo.album_id)
@@ -520,9 +570,9 @@ class AsyncJmApiClient(AsyncJmcomicClient):
         data = resp.model_data
         if data.get('redirect_aid', None) is not None:
             aid = data.redirect_aid
-            result = JmSearchPage.wrap_single_album(await self.get_album_detail(aid))
+            result = JmSearchPage.wrap_single_album(await self.get_album_detail(aid), page)
         else:
-            result = JmPageTool.parse_api_to_search_page(data)
+            result = JmPageTool.parse_api_to_search_page(data, page)
 
         self._cache_set(cache_key, result)
         return result
@@ -542,7 +592,7 @@ class AsyncJmApiClient(AsyncJmcomicClient):
                                 sub_category: str | None = None,
                                 ) -> JmCategoryPage:
         """
-        获取指定分类下的图集列表数据。
+        获取指定分类下的本子列表数据。
         注意：移动端不支持 sub_category。
         """
         o = f'{order_by}_{time}' if time != JmMagicConstants.TIME_ALL else order_by
@@ -553,7 +603,7 @@ class AsyncJmApiClient(AsyncJmcomicClient):
             'o': o,
         }
         resp = await self.req_api(self.API_CATEGORIES_FILTER, params=params)
-        return JmPageTool.parse_api_to_search_page(resp.model_data)
+        return JmPageTool.parse_api_to_search_page(resp.model_data, page)
 
     # month_ranking / week_ranking / day_ranking
     # 继承自 AsyncJmcomicClient 基类
@@ -579,11 +629,11 @@ class AsyncJmApiClient(AsyncJmcomicClient):
 
     async def favorite_folder(self,
                               page=1,
-                              order_by=JmMagicConstants.ORDER_BY_LATEST,
+                              order_by=JmMagicConstants.ORDER_FF_FAVORITE_TIME,
                               folder_id='0',
                               username='',
                               ) -> JmFavoritePage:
-        """获取收藏夹内特定目录的图集数据分页。"""
+        """获取收藏夹内特定目录的本子数据分页。"""
         resp = await self.req_api(
             self.API_FAVORITE,
             params={
@@ -592,19 +642,83 @@ class AsyncJmApiClient(AsyncJmcomicClient):
                 'o': order_by,
             }
         )
-        return JmPageTool.parse_api_to_favorite_page(resp.model_data)
+        return JmPageTool.parse_api_to_favorite_page(resp.model_data, page)
 
-    async def add_favorite_album(self, album_id, folder_id='0'):
+    async def album_pagination(self,
+                               jm_id: str,
+                               page=1,
+                               series=1,
+                               with_ad_wcm=1,
+                               need_total=True,
+                               ) -> JmAlbumCommentPage:
+        """获取本子评论分页，返回评论分页对象。"""
+        resp = await self.req_api(
+            self.API_FORUM,
+            params={
+                'mode': 'all',
+                'page': page,
+                'aid': JmcomicText.parse_to_jm_id(jm_id),
+            },
+        )
+        return JmPageTool.parse_api_to_album_comment_page(resp.model_data, page)
+
+    async def forum_pagination(self,
+                               page=1,
+                               with_ad_wcm=1,
+                               ) -> JmAlbumCommentPage:
+        """获取全站评论分页。"""
+        resp = await self.req_api(
+            self.API_FORUM,
+            params={
+                'mode': 'all',
+                'page': page,
+            },
+        )
+        return JmPageTool.parse_api_to_album_comment_page(resp.model_data, page)
+
+    async def toggle_favorite_album(self,
+                                    album_id,
+                                    folder_id='0',
+                                    expected_type: Optional[str] = None,
+                                    ):
         """
-        将指定图集加入用户的收藏夹。
-        注意：移动端没有提供 folder_id 参数。
+        切换本子的收藏状态（移动端接口底层为 Toggle 逻辑）。
+        :param album_id: 本子ID
+        :param folder_id: 移动端没有提供 folder_id 参数，保留参数兼容
+        :param expected_type: 期望的操作类型 ('add' | 'remove')，如果不匹配则抛异常
         """
-        # 服务端实现上使用带 body 的 GET 请求方式
-        resp = await self.req_api('/favorite', data={'aid': album_id})
+        resp = await self.req_api(
+            self.API_FAVORITE,
+            get=False,
+            data={'aid': album_id},
+        )
         data = resp.model_data
         if data.status != 'ok':
             ExceptionTool.raises_resp(data.msg, resp)
+
+        if expected_type is not None:
+            actual_type = data.type
+            if actual_type != expected_type:
+                ExceptionTool.raises_resp(
+                    f'收藏操作不符合预期，期望 [{expected_type}]，实际为 [{actual_type}]: {data.msg}',
+                    resp
+                )
+
         return resp
+
+    async def add_favorite_album(self, album_id, folder_id='0'):
+        """
+        将指定本子加入用户的收藏夹。
+        如果当前已收藏，将抛出异常以保证收藏语义明确。
+        """
+        return await self.toggle_favorite_album(album_id, folder_id, expected_type='add')
+
+    async def delete_favorite_album(self, album_id, folder_id='0'):
+        """
+        将指定本子移出用户的收藏夹。
+        如果当前未收藏，将抛出异常以保证取消收藏语义明确。
+        """
+        return await self.toggle_favorite_album(album_id, folder_id, expected_type='remove')
 
     async def album_comment(self,
                             video_id,
@@ -614,7 +728,7 @@ class AsyncJmApiClient(AsyncJmcomicClient):
                             comment_id=None,
                             **kwargs,
                             ) -> JmAlbumCommentResp:
-        """提交图集评论内容"""
+        """提交本子评论内容"""
         # 移动端 API 没有评论接口，此方法仅为接口完整性保留
         raise NotImplementedError('移动端 API 不支持评论功能，请使用网页端 JmHtmlClient')
 
@@ -658,8 +772,7 @@ class AsyncJmApiClient(AsyncJmcomicClient):
             return
 
         if JmModuleConfig.DOMAIN_API_UPDATED_LIST is not None:
-            if JmModuleConfig.DOMAIN_API_UPDATED_LIST:
-                self._domain_list = list(JmModuleConfig.DOMAIN_API_UPDATED_LIST)
+            self.update_old_api_domain(JmModuleConfig.DOMAIN_API_UPDATED_LIST)
             return
 
         # 尝试从域名服务器获取最新域名
@@ -682,8 +795,7 @@ class AsyncJmApiClient(AsyncJmcomicClient):
                 jm_log('api.update_domain.success',
                        f'获取到最新的API域名: {new_server_list}')
                 JmModuleConfig.DOMAIN_API_UPDATED_LIST = new_server_list
-                if sorted(self._domain_list) == sorted(JmModuleConfig.DOMAIN_API_LIST):
-                    self._domain_list = new_server_list
+                self.update_old_api_domain(new_server_list)
                 return
             except Exception as e:
                 jm_log('api.update_domain.error', f'通过[{url}]自动更新API域名失败: {e}')
@@ -707,20 +819,22 @@ class AsyncJmApiClient(AsyncJmcomicClient):
 
         cls = self.__class__
         async with cls._setup_lock:
-            if not cls._has_setup_domain_and_cookies:
-                await self.auto_update_domain()
-                if JmModuleConfig.FLAG_API_CLIENT_REQUIRE_COOKIES:
-                    await self.ensure_have_cookies()
-                cls._has_setup_domain_and_cookies = True
-            else:
-                # 即使已经初始化过域名和 cookie，也需要将已保存的全局 DOMAIN 和 COOKIES 赋值到当前 client
-                if JmModuleConfig.DOMAIN_API_UPDATED_LIST:
-                    self._domain_list = list(JmModuleConfig.DOMAIN_API_UPDATED_LIST)
-                if JmModuleConfig.FLAG_API_CLIENT_REQUIRE_COOKIES and JmModuleConfig.APP_COOKIES:
-                    # noinspection PyUnresolvedReferences
-                    self._session.cookies.update(JmModuleConfig.APP_COOKIES)
+            if self._has_setup:
+                return
 
-        self._has_setup = True
+            if not cls._has_setup_domain:
+                await self.auto_update_domain()
+                cls._has_setup_domain = True
+            else:
+                # 即使已经初始化过域名，也需要将已保存的全局 DOMAIN 赋值到当前 client
+                if JmModuleConfig.FLAG_API_CLIENT_AUTO_UPDATE_DOMAIN:
+                    self.update_old_api_domain(JmModuleConfig.DOMAIN_API_UPDATED_LIST)
+
+            # Cookie 属于 session 状态，每个 client 都需要独立确认。
+            if JmModuleConfig.FLAG_API_CLIENT_REQUIRE_COOKIES:
+                await self.ensure_have_cookies()
+
+            self._has_setup = True
 
     # ======================================================================
     # 生命周期

@@ -1,5 +1,7 @@
+from copy import deepcopy
 from threading import Lock
 
+from .jm_task_context import bind_jm_task_context
 from .jm_client_interface import *
 
 
@@ -56,6 +58,7 @@ class AbstractJmClient(
                            domain_index=0,
                            retry_count=0,
                            is_image=False,
+                           _retry_errors=None,
                            **kwargs,
                            ):
         """
@@ -80,8 +83,12 @@ class AbstractJmClient(
                                               **kwargs,
                                               )
 
+        if _retry_errors is None:
+            _retry_errors = []
+
         if domain_index >= len(self.domain_list):
-            return self.fallback(request, url, domain_index, retry_count, is_image, **kwargs)
+            return self.fallback(request, url, domain_index, retry_count, is_image,
+                                 retry_errors=_retry_errors, **kwargs)
 
         url_backup = url
 
@@ -117,11 +124,19 @@ class AbstractJmClient(
                 raise e
 
             self.before_retry(e, kwargs, retry_count, url)
+            _retry_errors.append({
+                'domain': self.domain_list[domain_index] if url_backup.startswith('/') else None,
+                'url': url,
+                'retry': retry_count,
+                'error': e,
+            })
 
         if retry_count < self.retry_times:
-            return self.request_with_retry(request, url_backup, domain_index, retry_count + 1, is_image, **kwargs)
+            return self.request_with_retry(request, url_backup, domain_index, retry_count + 1, is_image,
+                                           _retry_errors, **kwargs)
         else:
-            return self.request_with_retry(request, url_backup, domain_index + 1, 0, is_image, **kwargs)
+            return self.request_with_retry(request, url_backup, domain_index + 1, 0, is_image,
+                                           _retry_errors, **kwargs)
 
     # noinspection PyMethodMayBeStatic
     def raise_if_resp_should_retry(self, resp, is_image):
@@ -185,10 +200,10 @@ class AbstractJmClient(
 
                 result = cache.get(key, sentinel)
                 if result is not sentinel:
-                    return result
+                    return deepcopy(result) if isinstance(result, DetailEntity) else result
 
                 result = func(*args, **kwargs)
-                cache[key] = result
+                cache[key] = deepcopy(result) if isinstance(result, DetailEntity) else result
                 return result
 
             setattr(self, func_name, cache_wrapper)
@@ -209,10 +224,14 @@ class AbstractJmClient(
         self.domain_list = domain_list
 
     # noinspection PyUnusedLocal
-    def fallback(self, request, url, domain_index, retry_count, is_image, **kwargs):
+    def fallback(self, request, url, domain_index, retry_count, is_image, retry_errors=None, **kwargs):
         msg = f"请求重试全部失败: [{url}], {self.domain_list}"
         jm_log('req.fallback', msg)
-        ExceptionTool.raises(msg, {}, RequestRetryAllFailException)
+        ExceptionTool.raises(
+            msg,
+            {ExceptionTool.CONTEXT_KEY_RETRY_ERRORS: retry_errors or []},
+            RequestRetryAllFailException,
+        )
 
     # noinspection PyMethodMayBeStatic
     def append_params_to_url(self, url, params):
@@ -240,19 +259,19 @@ class JmHtmlClient(AbstractJmClient):
 
     API_SEARCH = '/search/photos'
     API_CATEGORY = '/albums'
+    API_ALBUM_PAGINATION = '/ajax/album_pagination'
+    API_FORUM = '/ajax/forum_more'
 
     def add_favorite_album(self,
                            album_id,
                            folder_id='0',
                            ):
-        data = {
-            'album_id': album_id,
-            'fid': folder_id,
-        }
-
-        resp = self.get_jm_html(
+        resp = self.post(
             '/ajax/favorite_album',
-            data=data,
+            data={
+                'album_id': str(album_id),
+                'fid': str(folder_id),
+            },
         )
 
         res = resp.json()
@@ -261,6 +280,30 @@ class JmHtmlClient(AbstractJmClient):
             msg = parse_unicode_escape_text(res['msg'])
             error_msg = PatternTool.match_or_default(msg, JmcomicText.pattern_ajax_favorite_msg, msg)
             # 此圖片已經在您最喜愛的清單！
+
+            self.raise_request_error(
+                resp,
+                error_msg
+            )
+
+        return resp
+
+    def delete_favorite_album(self,
+                              album_id,
+                              folder_id='0',
+                              ):
+        resp = self.post(
+            '/ajax/delete_favorite_album',
+            data={
+                'album_id': str(album_id),
+            },
+        )
+
+        res = resp.json()
+
+        if res['status'] != 1:
+            msg = parse_unicode_escape_text(res['msg'])
+            error_msg = PatternTool.match_or_default(msg, JmcomicText.pattern_ajax_favorite_msg, msg)
 
             self.raise_request_error(
                 resp,
@@ -332,9 +375,9 @@ class JmHtmlClient(AbstractJmClient):
         # 因为如果搜索的是禁漫车号，会直接跳转到本子详情页面
         if resp.redirect_count != 0 and '/album/' in resp.url:
             album = JmcomicText.analyse_jm_album_html(resp.text)
-            return JmSearchPage.wrap_single_album(album)
+            return JmSearchPage.wrap_single_album(album, page)
         else:
-            return JmPageTool.parse_html_to_search_page(resp.text)
+            return JmPageTool.parse_html_to_search_page(resp.text, page)
 
     @classmethod
     def build_search_url(cls, base: str, category: str, sub_category: Optional[str]):
@@ -375,7 +418,7 @@ class JmHtmlClient(AbstractJmClient):
             allow_redirects=True,
         )
 
-        return JmPageTool.parse_html_to_category_page(resp.text)
+        return JmPageTool.parse_html_to_category_page(resp.text, page)
 
     # -- 帐号管理 --
 
@@ -418,7 +461,7 @@ class JmHtmlClient(AbstractJmClient):
 
     def favorite_folder(self,
                         page=1,
-                        order_by=JmMagicConstants.ORDER_BY_LATEST,
+                        order_by=JmMagicConstants.ORDER_FF_FAVORITE_TIME,
                         folder_id='0',
                         username='',
                         ) -> JmFavoritePage:
@@ -435,7 +478,7 @@ class JmHtmlClient(AbstractJmClient):
             }
         )
 
-        return JmPageTool.parse_html_to_favorite_page(resp.text)
+        return JmPageTool.parse_html_to_favorite_page(resp.text, page)
 
     # noinspection PyTypeChecker
     def get_username_from_cookies(self) -> str:
@@ -526,9 +569,51 @@ class JmHtmlClient(AbstractJmClient):
         resp = self.post('/ajax/album_comment', data=data)
 
         ret = JmAlbumCommentResp(resp)
+        ret.require_success()
         jm_log('album.comment', f'{video_id}: [{comment}] ← ({ret.model().cid})')
 
         return ret
+
+    def album_pagination(self,
+                         jm_id: str,
+                         page=1,
+                         series=1,
+                         with_ad_wcm=1,
+                         need_total=True,
+                         ) -> JmAlbumCommentPage:
+        resp = self.post(
+            self.API_ALBUM_PAGINATION,
+            data={
+                'video_id': JmcomicText.parse_to_jm_id(jm_id),
+                'page': page,
+                'series': series,
+                'with_ad_wcm': with_ad_wcm,
+            }
+        )
+
+        ret = JmJsonResp(resp)
+        ret.require_success()
+        comment_page = JmPageTool.parse_html_to_album_comment_page(ret.model(), page)
+        if need_total:
+            album = self.get_album_detail(jm_id)
+            comment_page.total = album.comment_count
+
+        return comment_page
+
+    def forum_pagination(self,
+                         page=1,
+                         with_ad_wcm=1,
+                         ) -> JmAlbumCommentPage:
+        resp = self.post(
+            self.API_FORUM,
+            data={
+                'page': page,
+                'with_ad_wcm': with_ad_wcm,
+            },
+        )
+        ret = JmJsonResp(resp)
+        ret.require_success()
+        return JmPageTool.parse_html_to_album_comment_page(ret.model(), page)
 
     @classmethod
     def require_resp_success_else_raise(cls, resp, url: str):
@@ -608,6 +693,7 @@ class JmApiClient(AbstractJmClient):
     API_CHAPTER = '/chapter'
     API_SCRAMBLE = '/chapter_view_template'
     API_FAVORITE = '/favorite'
+    API_FORUM = '/forum'
 
     def search(self,
                search_query: str,
@@ -641,9 +727,9 @@ class JmApiClient(AbstractJmClient):
         data = resp.model_data
         if data.get('redirect_aid', None) is not None:
             aid = data.redirect_aid
-            return JmSearchPage.wrap_single_album(self.get_album_detail(aid))
+            return JmSearchPage.wrap_single_album(self.get_album_detail(aid), page)
 
-        return JmPageTool.parse_api_to_search_page(data)
+        return JmPageTool.parse_api_to_search_page(data, page)
 
     def categories_filter(self,
                           page: int,
@@ -667,7 +753,7 @@ class JmApiClient(AbstractJmClient):
 
         resp = self.req_api(self.append_params_to_url(self.API_CATEGORIES_FILTER, params))
 
-        return JmPageTool.parse_api_to_search_page(resp.model_data)
+        return JmPageTool.parse_api_to_search_page(resp.model_data, page)
 
     def get_album_detail(self, album_id) -> JmAlbumDetail:
         return self.fetch_detail_entity(album_id,
@@ -839,7 +925,7 @@ class JmApiClient(AbstractJmClient):
 
     def favorite_folder(self,
                         page=1,
-                        order_by=JmMagicConstants.ORDER_BY_LATEST,
+                        order_by=JmMagicConstants.ORDER_FF_FAVORITE_TIME,
                         folder_id='0',
                         username='',
                         ) -> JmFavoritePage:
@@ -852,17 +938,62 @@ class JmApiClient(AbstractJmClient):
             }
         )
 
-        return JmPageTool.parse_api_to_favorite_page(resp.model_data)
+        return JmPageTool.parse_api_to_favorite_page(resp.model_data, page)
 
-    def add_favorite_album(self,
-                           album_id,
-                           folder_id='0',
-                           ):
+    def album_comment(self,
+                      video_id,
+                      comment,
+                      originator='',
+                      status='true',
+                      comment_id=None,
+                      **kwargs,
+                      ) -> JmAlbumCommentResp:
+        raise NotImplementedError('移动端 API 不支持评论功能，请使用网页端 JmHtmlClient')
+
+    def album_pagination(self,
+                         jm_id: str,
+                         page=1,
+                         series=1,
+                         with_ad_wcm=1,
+                         need_total=True,
+                         ) -> JmAlbumCommentPage:
+        resp = self.req_api(
+            self.API_FORUM,
+            params={
+                'mode': 'all',
+                'page': page,
+                'aid': JmcomicText.parse_to_jm_id(jm_id),
+            },
+        )
+        return JmPageTool.parse_api_to_album_comment_page(resp.model_data, page)
+
+    def forum_pagination(self,
+                         page=1,
+                         with_ad_wcm=1,
+                         ) -> JmAlbumCommentPage:
+        resp = self.req_api(
+            self.API_FORUM,
+            params={
+                'mode': 'all',
+                'page': page,
+            },
+        )
+        return JmPageTool.parse_api_to_album_comment_page(resp.model_data, page)
+
+    def toggle_favorite_album(self,
+                              album_id,
+                              folder_id='0',
+                              expected_type: Optional[str] = None,
+                              ):
         """
-        移动端没有提供folder_id参数
+        切换本子的收藏状态（移动端接口底层为 Toggle 逻辑）。
+        :param album_id: 本子ID
+        :param folder_id: 移动端没有提供 folder_id 参数，保留参数兼容
+        :param expected_type: 期望的操作类型 ('add' | 'remove')，如果不匹配则抛异常
         """
         resp = self.req_api(
-            '/favorite',
+            self.API_FAVORITE,
+            get=False,
             data={
                 'aid': album_id,
             },
@@ -870,7 +1001,35 @@ class JmApiClient(AbstractJmClient):
 
         self.require_resp_status_ok(resp)
 
+        if expected_type is not None:
+            actual_type = resp.model_data.type
+            if actual_type != expected_type:
+                ExceptionTool.raises_resp(
+                    f'收藏操作不符合预期，期望 [{expected_type}]，实际为 [{actual_type}]: {resp.model_data.msg}',
+                    resp
+                )
+
         return resp
+
+    def add_favorite_album(self,
+                           album_id,
+                           folder_id='0',
+                           ):
+        """
+        把本子加入收藏夹。
+        如果当前已收藏，将抛出异常以保证收藏语义明确。
+        """
+        return self.toggle_favorite_album(album_id, folder_id, expected_type='add')
+
+    def delete_favorite_album(self,
+                              album_id,
+                              folder_id='0',
+                              ):
+        """
+        从收藏夹移除本子。
+        如果当前未收藏，将抛出异常以保证取消收藏语义明确。
+        """
+        return self.toggle_favorite_album(album_id, folder_id, expected_type='remove')
 
     # noinspection PyMethodMayBeStatic
     def require_resp_status_ok(self, resp: JmApiResp):
@@ -1159,7 +1318,7 @@ class PhotoConcurrentFetcherProxy(JmcomicClient):
 
             # after future done, remove it from future_dict.
             # cache depends on self.client instead of self.future_dict
-            future = self.FutureWrapper(self.executors.submit(task),
+            future = self.FutureWrapper(self.executors.submit(bind_jm_task_context(task)),
                                         after_done_callback=lambda: self.future_dict.pop(cache_key, None)
                                         )
 
